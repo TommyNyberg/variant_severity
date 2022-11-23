@@ -1,0 +1,701 @@
+---
+title: "Standardised code to compare VOCs for case severity risk"
+author: "Tommy Nyberg"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+    html_document:
+        df_print: paged
+        code_folding: hide
+        toc:          true
+        toc_float:    true
+        number_sections: true
+    html_notebook:
+        code_folding: hide
+        toc:          true
+        toc_float:    true
+        number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#memory.limit(32*1024^2)
+
+library(rms)
+library(tidyverse)
+library(ggridges)
+library(lubridate)
+library(table1)
+library(MatchIt)
+
+#Redefine the working directory as needed
+setwd()
+
+#Country name (used for output file names)
+country <- ""
+
+date_of_analysis <- Sys.Date()
+
+```
+
+
+```{r helper functions}
+
+modelSummary <- function(mod,modelDescription=NULL){ 
+  estimate <- exp(coef(mod))
+  CI       <- exp(confint(mod))
+  bind_cols(model     = modelDescription,
+            covariate = names(estimate),
+            estimate = estimate,
+            CIL95     = CI[,1],
+            CIU95     = CI[,2],
+            StdErr    = sqrt(diag(mod$var))
+  )
+}
+
+
+```
+
+# Disclaimer
+
+This code document is intended to be used in the WHO/ECDC collaborative study on variant severity. 
+This is the second version of the code to be circulated.
+
+
+# Instructions
+
+The analysis dataset is assumed to be called "d". 
+
+The dataset d should include:
+
+- VOC variable: categorical (factor) variable taking exactly two levels corresponding to the old variant and the new variant of concern under study (e.g. Delta and Omicron). 
+
+- outcomes variables: assumed to have one binary status variable (0= no event within the follow-up time, 1= event within the follow-up time), and a follow-up time variable (equal to time from positive test to event for those with event, or time from positive test to being censored for those without event). Alternatively, if status and follow-up time variables are not available but the dates of events are available, the status and follow-up time can be calculated, assuming that censoring for non-mortality outcomes occurs at the earliest of death, end of the observation window, or [outcomeTimeMax] (e.g. 14) days after positive test. 
+
+- required variables: this list should not be changed by the local investigator, as availability of all of these adjustment variables is required for participation in the joint study. These variables include DATE (date variable: date of positive test), WEEK (categorical: ISO week of positive test; defined based on DATE), AREA (categorical: area of residence), VACC (categorical: vaccination status at date of positive test), AGE (numerical: age in years), AGE10YR (categorical: 10-year age groups; defined based on AGE), SEX (categorical: biological sex). The three variables WEEK, AGE10YR and VACC can either be included by the user [calculate_cat_ageweekvacc <- FALSE], or can optionally be calculated at runtime provided that the variables DATE, AGE, and vacc_date_1, vacc_date_2 and vacc_date_3 exist in the datset. To request that the variables are calculated, set [calculate_cat_ageweekvacc <- TRUE].
+
+- highly desired variables: this list includes REINF (categorical: reinfection status).
+
+- desired variables: this list is not standardised and may be updated by the local investigator, according to which variables are available in the local setting. It may include data on ethnic group, socioeconomic status, comorbidities or recent international travel.
+
+
+# Settings and variable lists
+
+In the below code, the definitions of the analysis inclusion period and lists of outcome and adjustment variable names are defined. The investigator may also set up whether the outcome status and follow-up time variables should be calculated from the corresponding outcome date variables [calculate_time_to_event_vars <- TRUE], and whether the categorical age group, week and vaccination status variables should be calculated [calculate_cat_ageweekvacc <- TRUE].
+
+```{r settings and variable lists}
+
+
+#### THE BELOW PARAMETERS AND VARIABLE NAMES MAY BE UPDATED ACCORDING TO THE LOCALLY AVAILABLE DATA ON OUTCOMES AND DESIRED CONFOUNDERS #### 
+
+# update to the date of the start of the inclusion period
+inclusion_date_start <- as_date("2021-12-01")
+# update to the date of the end of the inclusion period
+inclusion_date_end   <- as_date("2022-01-31")
+
+# if TRUE, the categorical variables AGE10YR (10-year age group) and WEEK (calendar week) are calculated at run-time from the corresponding variables AGE and DATE.
+calculate_cat_ageweek <- TRUE
+# if TRUE, the categorical variable VACC (vaccination status) is calculated at run-time from the corresponding variables {vacc_date_1, vacc_date_2, vacc_date_3}.
+calculate_cat_vacc    <- TRUE
+# if TRUE, the outcome variables in outcome_varnames and outcomeTime_varnames are calculated at run-time from their corresponding dates (see below)
+calculate_time_to_event_vars <- FALSE
+
+# For each outcome, either of the following sets variables need to be included in the dataset. The variable names for the outcomes should be listed in the four vectors [outcomeDate_varnames], [outcomeTimeMax], [outcome_varnames] and [outcomeTime_varnames]. 
+#   (1) a date of the event [outcomeDate_varnames] and the maximum follow-up time from positive test [outcomeTimeMax], 
+#   and/or 
+#   (2) status of the event (coded as 0/1) [outcome_varnames] and a pre-computed time-to-event (survival time) variable [outcomeTime_varnames].
+# If (1) is included, the variables in (2) can be computed at run-time by setting calculate_time_to_event_vars to TRUE.
+# The code assumes that values for each outcome are in the same position in each vector.
+
+#outcomeDate_varnames <- 
+#  c("hospAtt_date","hospAttCOVID_date","hospAdm_date","hospAdmCOVID_date","icuAdm_date","icuAdmCOVID_date","death_date","deathCOVID_date")
+#outcomeTimeMax       <-
+#  c(14,            14,                 14,            14,                 14,           14,                28,          28)
+#outcome_varnames     <- 
+#  c("hospAtt",     "hospAttCOVID",     "hospAdm",     "hospAdmCOVID",     "icuAdm",     "icuAdmCOVID",     "death",     "deathCOVID")
+#outcomeTime_varnames <- 
+#  c("hospAtt_time","hospAttCOVID_time","hospAdm_time","hospAdmCOVID_time","icuAdm_time","icuAdmCOVID_time","death_time","deathCOVID_time")
+outcomeDate_varnames <- c("hospAtt_date","hospAdm_date","death_date")
+outcomeTimeMax       <- c(14,            14,            28)
+outcome_varnames     <- c("hospAtt",     "hospAdm",     "death")
+outcomeTime_varnames <- c("hospAtt_time","hospAdm_time","death_time")
+
+
+# The highly desired adjustment variable is expected to follow a standardised format
+adj_varname_highlydesired <- c("REINF") 
+
+# The desired variables (and their categories etc) are not standardised, and the local investigators may change the variables in the list according to which adjustement variables are available in the local setting 
+adj_varname_desired <- c("ETHN","SES","COMORB","TRAVEL") 
+
+
+
+
+#### THE BELOW VARIABLES ARE EXPECTED TO BE ON A STANDARDISED FORMAT AND SHOULD NOT BE CHANGED ####
+
+#Primary predictor, VOC which should be a categorical (factor) variable with exactly two levels corresponding to the old variant and the new variant
+voc_varname <- "VOC" 
+
+# The required adjustment variables are standardised and should (with the exception of AREA which is specific to the local setting) follow the format specified in the study protocol
+adj_varname_required <- c("DATE","WEEK","AREA","VACC","AGE","AGE10YR","SEX") 
+
+  # Specification of how the required adjustment variables should be included in model formulae when fitting models
+  #  As outlined in the study protocol, this includes (A) stratification for exact date, area and vaccination status, or (B) stratification for week, area and vaccination status. 
+adj_varname_requiredA <- c("strata(DATE)","strata(AREA)","strata(VACC)","AGE10YR","AGE10YR:AGE","SEX") 
+adj_varname_requiredB <- c("strata(WEEK)","strata(AREA)","strata(VACC)","WEEK:DATE_num","AGE10YR","AGE10YR:AGE","SEX") 
+
+
+```
+
+
+
+# Check variables
+
+Optional code to check that the required variables are on the expected formats. The switch [checkVariableClasses_required] may optionally be set to FALSE if the investigator wants to suppress this checking. 
+
+By default, checking is also done for the highly desired and desired adjustment variables. If data on those variables are unavailable (or the investigator is confident that the results of those checks are not correct), the investigator may choose to reset [checkVariableClasses_highlydesired] and/or [checkVariableClasses_desired] to FALSE.
+
+```{r check variables}
+
+checkVariableClasses_required <- TRUE
+checkVariableClasses_highlydesired <- TRUE
+checkVariableClasses_desired <- TRUE
+
+
+checkDateVar <- function(var="",data=d){
+  if( !is.Date(data %>% pull(var)) ) {
+    stop(paste0(var,": Error, expected to be a Date variable but is instead: ", class(data %>% pull(var)),". Can it be converted to Date using e.g. ymd() or dmy()?"))
+  }
+}
+checkNumericVar <- function(var="",data=d,minvalue=NULL,maxvalue=NULL){
+  if( !is.numeric(data %>% pull(var)) ) {
+    unique_vals <- unique(data %>% pull(var))
+    if(length(unique_vals)<=5) {
+      stop(paste0(var,": Error, expected to be a numeric variable but is instead: ", 
+                  class(data %>% pull(var))," with values ", paste(unique_vals,collapse=", "), "."))
+    } else {
+      stop(paste0(var,": Error, expected to be a numeric variable but is instead: ", 
+                  class(data %>% pull(var))," with >5 unique values."))
+    }
+  } else if(!is.null(minvalue) | !is.null(maxvalue)) {
+    if(any(data %>% pull(var) > maxvalue)) {
+      stop(paste0(var,": Error, expected to take numerical values in the range ", minvalue," to ", maxvalue, " but at least one value is outside this range."))
+    }
+  }
+}
+checkBinaryVar <- function(var="",data=d){
+  if( !is.numeric(data %>% pull(var)) | 
+      any(! data %>% pull(var) %in% 0L:1L ) ) {
+    unique_vals <- unique(data %>% pull(var))
+    if(length(unique_vals)<=5) {
+      stop(paste0(var,": Error, expected to be a binary (0/1) variable but is instead: ", 
+                  class(data %>% pull(var)), " with values ", paste(unique_vals,collapse=", "), "."))
+    } else {
+      stop(paste0(var,": Error, expected to be a binary (0/1) variable but is instead: ", 
+                  class(data %>% pull(var)), " with >5 unique values."))
+    }
+  }
+}
+checkCategoricalVar <- function(var="",data=d,num_levels=NULL,requireFactor=FALSE){
+  if( !( is.factor(data %>% pull(var)) | is.character(data %>% pull(var)) ) ) {
+    unique_vals <- unique(data %>% pull(var))
+    if(length(unique_vals)<=5) {
+      stop(paste0(var,": Error, expected to be a factor/categorical variable but is instead: ", 
+                  class(data %>% pull(var)), " with values ", paste(unique_vals,collapse=", "),"."))
+    } else {
+      stop(paste0(var,": Error, expected to be a factor/categorical variable but is instead: ", 
+                  class(data %>% pull(var)), " with >5 unique values."))
+    }
+  } else if(!is.null(num_levels)) {
+    unique_vals <- unique(data %>% pull(var))
+    if(length(unique_vals)!=num_levels){
+      stop(paste0(var,": Error, the factor/categorical variable is expected to have ", 
+                  num_levels, " levels but instead takes the ", length(unique_vals), " values: ", paste(unique_vals,collapse=", "), "."))
+    }
+  }
+  if(requireFactor) {
+    if( !is.factor(data %>% pull(var)) ) {
+      stop(paste0(var,": Error, this categorical variable is required to be coded as a factor variable but is instead: ", 
+                  class(data %>% pull(var)), "."))
+    }
+  }
+
+}
+
+if(checkVariableClasses_required) {
+  
+  # Check outcomes variables
+  
+  if(calculate_time_to_event_vars){
+    for(i in seq_along(outcomeDate_varnames)){
+      checkDateVar(outcomeDate_varnames[i])
+    }
+  }
+  if(!calculate_time_to_event_vars){
+    for(i in seq_along(outcome_varnames)){
+      checkBinaryVar(outcome_varnames[i])
+    }
+    for(i in seq_along(outcomeTime_varnames)){
+      checkNumericVar(outcomeTime_varnames[i],minvalue=0.5,maxvalue=outcomeTimeMax[i])
+    }
+  }
+  
+
+  
+  # Check VOC variable
+  
+  checkCategoricalVar("VOC",num_levels=2,requireFactor=TRUE)
+  
+  
+
+  # Check required adjustment variables
+
+  date_vars <- c("DATE")
+  for(i in seq_along(date_vars)){
+    checkDateVar(date_vars[i])
+  }
+  
+  numerical_vars <- c("AGE")
+  for(i in seq_along(numerical_vars)){
+    checkNumericVar(numerical_vars[i])
+  }
+  
+  categorical_vars <- c("AREA","SEX")
+  for(i in seq_along(categorical_vars)){
+    checkCategoricalVar(categorical_vars[i])
+  }
+  
+  
+  categorical_vars_possiblyUndefined <- c("AGE10YR","WEEK")
+  for(i in seq_along(categorical_vars_possiblyUndefined)){
+    if(exists(categorical_vars_possiblyUndefined[i],d)) {
+      checkCategoricalVar(categorical_vars_possiblyUndefined[i],requireFactor=TRUE)
+    } else {
+      if(!calculate_cat_ageweek) {
+        warning(paste0(categorical_vars_possiblyUndefined[i],
+                       ": undefined required variable. Should this variable be calculated [calculate_cat_ageweek <- TRUE]?"))
+      }
+    }
+  }
+  categorical_vars_possiblyUndefined <- c("VACC")
+  for(i in seq_along(categorical_vars_possiblyUndefined)){
+    if(exists(categorical_vars_possiblyUndefined[i],d)) {
+      checkCategoricalVar(categorical_vars_possiblyUndefined[i],requireFactor=TRUE)
+    } else {
+      if(!calculate_cat_vacc) {
+        warning(paste0(categorical_vars_possiblyUndefined[i],
+                       ": undefined required variable. Should this variable be calculated [calculate_cat_vacc <- TRUE]?"))
+      }
+    }
+  }
+
+
+
+  print("OK: All checked required variables have the expected formats.")
+  
+}  
+
+
+if(checkVariableClasses_highlydesired) {
+  
+  # Check REINF variable
+  
+  checkCategoricalVar("REINF",num_levels=2,requireFactor=TRUE)
+
+  print("OK: All checked highly desired variables have the expected formats.")
+  
+}  
+
+
+
+if(checkVariableClasses_desired) {
+  
+  # Check desired variables -- assume all provided as categorical
+  
+  for(i in seq_along(adj_varname_desired)) {
+    if(exists(adj_varname_desired[i],d)) {
+      checkCategoricalVar(adj_varname_desired[i])
+    } else {
+      stop(paste0(adj_varname_desired[i],
+                       ": undefined variable specified in the [adj_varname_desired] variable list. Does this variable exist, or should it be removed from [adj_varname_desired]?"))
+    }
+  }
+  
+  print("OK: All checked desired variables have the expected formats.")
+  
+}  
+
+
+
+
+
+```
+
+
+
+# Recode variables (if requested)
+
+The below code creates variables for outcome status and follow-up time if [calculate_time_to_event_vars] is set to TRUE, and creates categorical age group, calendar week and/or vaccination status variables if [calculate_cat_ageweek] or [calculate_cat_vacc] are set to TRUE. These switches are set in the initial settings and variable list definitions above.
+
+```{r recode vars}
+
+if(calculate_time_to_event_vars==TRUE) {
+  for(i in seq_along(outcome_varnames)) {
+    d[,outcomeTime_varnames[i]] <- case_when( !is.na( d[,outcomeDate_varnames[i]] ) ~ as.numeric( d[,outcomeDate_varnames[i]] - d[,"DATE"] ),
+                                              TRUE  ~ pmin( as.numeric( d[,"death_date"] - d[,"DATE"] ),
+                                                            as.numeric( inclusion_date_end - d[,"DATE"] ),
+                                                            outcomeTimeMax[i]
+                                                            )
+                                              )
+    d[,outcomeTime_varnames[i]] <- pmax(0.5, d[,outcomeTime_varnames[i]])
+    d[,outcome_varnames[i]] <- !is.na( d[,outcomeDate_varnames[i]] ) & d[,outcomeTime_varnames[i]] <= outcomeTimeMax[i]
+  }
+}
+
+
+if(calculate_cat_ageweek==TRUE) {
+  d <- d %>%
+    mutate(AGE10YR = cut(AGE, breaks = c(0,20,40,50,60,70,Inf),
+                         right = FALSE,
+                         include.lowest = TRUE, ordered.result = TRUE),
+           WEEK = factor(paste(isoyear(DATE),isoweek(DATE),sep="-"))
+    )
+}
+
+if(calculate_cat_vacc==TRUE) {
+  d <- d %>%
+    mutate(timeVacc1Specimen = as.numeric(DATE - vacc_date_1),
+           timeVacc2Specimen = as.numeric(DATE - vacc_date_2),
+           timeVacc3Specimen = as.numeric(DATE - vacc_date_3),
+           VACC = factor( case_when(
+             !is.na(timeVacc3Specimen) & timeVacc3Specimen >= 14 ~ ">=14d after third dose",
+             !is.na(timeVacc2Specimen) & timeVacc2Specimen >= 153 ~ ">=153d after second dose",
+             !is.na(timeVacc2Specimen) & timeVacc2Specimen >= 14 ~ ">=14d after second dose",
+             !is.na(timeVacc1Specimen) & timeVacc1Specimen >= 0 ~ ">=0d after first dose",
+             is.na(timeVacc1Specimen) | timeVacc1Specimen < 0 ~ "Unvaccinated",
+           ), levels=c("Unvaccinated",
+                       ">=0d after first dose",
+                       ">=14d after second dose",
+                       ">=153d after second dose",
+                       ">=14d after third dose")
+           )
+    )
+}
+
+
+#create a numerical version of the DATE variable (used in the adjustments B that include linear trends of DATE within WEEKs)
+if(!exists("DATE_num",d)) {
+  d <- d %>%
+    mutate(DATE_num = as.numeric( DATE - median(DATE) )
+    )
+}
+
+
+```
+
+
+
+# Descriptives
+
+The below code generates descriptive tables of the required, highly desired and desired variables, by VOC. It also generates a descriptive table of the numbers and proportions of cases with each outcome, by VOC.
+
+
+```{r descriptives}
+
+#custom render function to print continuous variables with mean (SD) and median (Q1-Q3) in tables
+custom.render.cont <- function(x) {
+  with(stats.apply.rounding(stats.default(x), digits = 3),
+       c("",
+         "Mean (SD)"      = sprintf(paste("%s (%s)"), MEAN,SD),
+         "Median (Q1-Q3)" = sprintf(paste("%s (%s-%s)"), MEDIAN,Q1,Q3)
+         ))
+}
+
+table_descriptiveCovariates <- as.data.frame( table1( as.formula( paste0( "~", paste0(c("SEX","AGE","AGE10YR","WEEK","AREA","VACC",
+                                                                                        adj_varname_highlydesired,
+                                                                                        adj_varname_desired),collapse="+"), "| VOC") ), 
+                                                      data=d, 
+                                                      render.cont=custom.render.cont ) )
+table_descriptiveCovariates
+
+
+table_descriptiveOutc <- list()
+for(i in seq_along(outcome_varnames)) {
+  table_descriptiveOutc[[i]] <- 
+    d %>% 
+    group_by(VOC) %>%
+    count(across(outcome_varnames[i])) %>%
+    mutate(N=sum(n),
+           p=signif(n/N,2)) %>%
+    filter(across(outcome_varnames[i]) == 1) %>%
+    mutate(outcome = outcome_varnames[i]) %>%
+    select(outcome,VOC,n,N,p)
+}
+table_descriptiveOutc <- bind_rows(table_descriptiveOutc)
+table_descriptiveOutc
+
+
+write.csv(table_descriptiveCovariates, 
+          paste0("table_descriptiveCovariates","_",country,"_",date_of_analysis,".csv"), row.names=FALSE)
+write.csv(table_descriptiveOutc, 
+          paste0("table_descriptiveOutc","_",country,"_",date_of_analysis,".csv"), row.names=FALSE)
+
+```
+
+
+
+# Hazard ratios estimated through stratified Cox regression
+
+This code fits stratified Cox regression models to estimate:
+\begin{enumerate}
+  \item HR for VOC, unadjusted.
+  \item HR for VOC, adjusted for the required (A) adjustment variables.
+  \item HR for VOC, adjusted for the required (B) adjustment variables.
+  \item HR for VOC, adjusted for the required (A) and highly desired adjustment variables.
+  \item HR for VOC, adjusted for the required (B) and highly desired adjustment variables.
+  \item HR for VOC, adjusted for the required (A), highly desired and desired adjustment variables.
+  \item HR for VOC, adjusted for the required (B), highly desired and desired adjustment variables.
+\end{enumerate}
+The required adjustment variables are either modelled using: (A) stratification for exact calendar date, area and vaccination status, and using regression adjustments for 10-year age group, within-age-group exact age (linear term) and sex; or, (B) stratification for calendar week, area and vaccination status, and using regression adjustments for within-calendar-week exact date (linear term), 10-year age group, within-age-group exact age (linear term) and sex. The highly desired and desired variables are always adjusted for using regression adjustments.
+
+These models are fitted first to estimate the overall HR for VOC, and then refitted assuming age-group-specific HRs for VOC, or vaccination-status-specific HRs for VOC.
+
+
+
+
+```{r strcox}
+
+
+#create model formulae
+mUnadj             <- paste0( voc_varname )
+mAdjReqA           <- paste0( voc_varname, "+", paste(adj_varname_requiredA,collapse="+") )
+mAdjReqB           <- paste0( voc_varname, "+", paste(adj_varname_requiredB,collapse="+") )
+mAdjReqAHighdes    <- paste0( mAdjReqA, "+", paste(adj_varname_highlydesired,collapse="+") )
+mAdjReqBHighdes    <- paste0( mAdjReqB, "+", paste(adj_varname_highlydesired,collapse="+") )
+mAdjReqAHighdesDes <- paste0( mAdjReqAHighdes, "+", paste(adj_varname_desired,collapse="+") )
+mAdjReqBHighdesDes <- paste0( mAdjReqBHighdes, "+", paste(adj_varname_desired,collapse="+") )
+
+modelDesc. <- c("Unadj","AdjReqA","AdjReqB","AdjReqAHighdes","AdjReqBHighdes","AdjReqAHighdesDes","AdjReqBHighdesDes")
+modelDesc <- c()
+modelList <- list()
+for(i in seq_along(outcome_varnames)){
+  oSurv <- paste( "Surv(",outcomeTime_varnames[i],",", outcome_varnames[i],")" )
+  modelDesc <- c(modelDesc, paste(outcome_varnames[i], modelDesc., sep="-") )
+  modelList <- c(modelList, 
+                 list(
+                   as.formula(paste( oSurv, "~", mUnadj ) ),
+                   as.formula(paste( oSurv, "~", mAdjReqA )),
+                   as.formula(paste( oSurv, "~", mAdjReqB )),
+                   as.formula(paste( oSurv, "~", mAdjReqAHighdes )),
+                   as.formula(paste( oSurv, "~", mAdjReqBHighdes )),
+                   as.formula(paste( oSurv, "~", mAdjReqAHighdesDes )),
+                   as.formula(paste( oSurv, "~", mAdjReqBHighdesDes ))
+                 )
+  )
+}
+
+
+
+
+# Fit primary models for the whole dataset
+#  The code loops over the models in the modelList and fits Cox regression models on the format
+#  coxph( Surv(outcomeTime,outcomeStatus) ~ VOC + strata(stratification_variables) + other_adjustment_variables, data=d )
+
+resultList <- list()
+nmodels <- length(modelList)
+pb <- txtProgressBar(max=nmodels)
+for (i in 1:nmodels){
+   cxmod <- coxph( modelList[[i]], data=d )
+   resultList[[i]] <- modelSummary(cxmod, modelDesc[i])
+   setTxtProgressBar(pb,i)
+}
+close(pb)
+resultData <- bind_rows(resultList) 
+resultData
+
+write.csv(resultData, paste0("HR_main_",country,"_",date_of_analysis,".csv"))
+
+
+
+
+#Interaction analyses
+
+VOClvl     <- d %>% pull(VOC) %>% levels()
+
+# By age group
+
+AGE10YRlvl <- d %>% pull(AGE10YR) %>% levels()
+
+resultList.age10yr <- list()
+nmodels <- length(modelList)
+pb <- txtProgressBar(max=nmodels)
+for (i in 1:nmodels){
+  cxmod <- coxph( update(modelList[[i]], . ~ . - VOC + AGE10YR + AGE10YR_VOC) , 
+                  data=d %>% mutate(AGE10YR_VOC = fct_collapse(interaction(AGE10YR,VOC),
+                                                               "reference"=paste( AGE10YRlvl, VOClvl[1], sep="." ))  
+                  ) 
+  )
+  resultList.age10yr[[i]] <- modelSummary(cxmod, modelDesc[i]) 
+  setTxtProgressBar(pb,i)
+}
+close(pb)
+resultData.age10yr <- bind_rows(resultList.age10yr) 
+resultData.age10yr
+
+write.csv(resultData.age10yr, paste0("HR_age_",country,"_",date_of_analysis,".csv"))
+
+
+
+
+# By vaccination status
+
+VACClvl <- d %>% pull(VACC) %>% levels()
+
+resultList.vacc <- list()
+nmodels <- length(modelList)
+pb <- txtProgressBar(max=nmodels)
+for (i in 1:nmodels){
+   cxmod <- coxph( update(modelList[[i]], . ~ . - VOC + strata(VACC) + VACC_VOC) , 
+                data=d %>% mutate(VACC_VOC = fct_collapse(interaction(VACC,VOC),
+                                                          "reference"=paste( VACClvl, VOClvl[1], sep="." )) 
+                                  )
+                )
+   resultList.vacc[[i]] <- modelSummary(cxmod, modelDesc[i]) 
+   setTxtProgressBar(pb,i)
+}
+close(pb)
+resultData.vacc <- bind_rows(resultList.vacc) 
+resultData.vacc
+
+write.csv(resultData.vacc, paste0("HR_vacc_",country,"_",date_of_analysis,".csv"))
+
+
+
+
+
+# By vaccination status & reinfection status
+
+VACClvl  <- d %>% pull(VACC)  %>% levels()
+REINFlvl <- d %>% pull(REINF) %>% levels()
+
+resultList.vaccreinf <- list()
+nmodels <- length(modelList)
+pb <- txtProgressBar(max=nmodels)
+for (i in 1:nmodels){
+   cxmod <- coxph( update(modelList[[i]], . ~ . - VOC + strata(VACC) + REINF + VACC_REINF_VOC) , 
+                data=d %>% mutate(VACC_REINF_VOC = fct_collapse(interaction(VACC,REINF,VOC),
+                                                          "reference"=paste( VACClvl, rep(REINFlvl,each=length(VACClvl)), VOClvl[1], sep="." )) 
+                                  )
+                )
+   resultList.vaccreinf[[i]] <- modelSummary(cxmod, modelDesc[i]) 
+   setTxtProgressBar(pb,i)
+}
+close(pb)
+resultData.vaccreinf <- bind_rows(resultList.vaccreinf) 
+resultData.vaccreinf
+
+write.csv(resultData.vaccreinf, paste0("HR_vaccreinf_",country,"_",date_of_analysis,".csv"))
+
+
+
+
+
+# By vaccination status & age group
+
+VACClvl    <- d %>% pull(VACC)  %>% levels()
+AGE10YRlvl <- d %>% pull(AGE10YR) %>% levels()
+
+resultList.vaccage <- list()
+nmodels <- length(modelList)
+pb <- txtProgressBar(max=nmodels)
+for (i in 1:nmodels){
+   cxmod <- coxph( update(modelList[[i]], . ~ . - VOC + strata(VACC) + AGE10YR + VACC_AGE_VOC) , 
+                data=d %>% mutate(VACC_AGE_VOC = fct_collapse(interaction(VACC,AGE10YR,VOC),
+                                                          "reference"=paste( VACClvl, rep(AGE10YRlvl,each=length(VACClvl)), VOClvl[1], sep="." )) 
+                                  )
+                )
+   resultList.vaccage[[i]] <- modelSummary(cxmod, modelDesc[i])
+   setTxtProgressBar(pb,i)
+}
+close(pb)
+resultData.vaccage <- bind_rows(resultList.vaccage) 
+resultData.vaccage
+
+write.csv(resultData.vaccage, paste0("HR_vaccage_",country,"_",date_of_analysis,".csv"))
+
+```
+
+
+
+#Epidemic phase bias sensitivity analysis according to Seaman et al (2022)
+
+Epidemic phase bias may arise when comparing two variants and adjusting for the calendar date of positive test, instead of the (typically unknown) calendar date of infection. The HR for VOC may then differ from the HR for VOC adjusted for calendar date of infection, if disease severity is correlated with time from infection to positive test (e.g. if time from infection to positive test is shorter for more severe cases than for less severe cases). A sensitivity analysis has been proposed where, with the objective to create a proxy adjustment variable for date of infection. This is done by shifting the date of positive test for those with an outcome of interest to a somewhat later date, according to the assumed difference [epbShift] in mean number of days from infection to positive test for those without versus those with an outcome (Seaman et al 2022).
+
+The sensitivity analysis is applied for epbShift = 0,...,4 days (epbShift=0 corresponds with no adjustment). Individuals who fall outside the study date interval after the shift are dropped in this analysis.
+
+```{r epidemic phase bias sensitivity analysis}
+
+
+EpidemicPhaseBias <- function(epbShift=0L:1L,outcomes=outcome_varnames,models=modelList,modelDescriptions=modelDesc,
+                              dStart=inclusion_date_start,dEnd=inclusion_date_end,data=d) {
+  
+  resultList.ebp <- list()
+  nmodels <- length(models)
+  
+  data <- data %>% 
+    mutate( atLeast1Outc = rowSums(across(all_of(outcomes))) > 0 )
+  
+  for(s in seq_along(epbShift)) {
+    
+    data.epb <- data %>%
+      mutate(
+        
+        DATE = if_else(atLeast1Outc, DATE + epbShift[s], DATE),
+        WEEK = paste(isoyear(DATE),isoweek(DATE),sep="-"),
+        DATE_num = as.numeric( DATE - median(DATE) ),
+        
+        inclIntervalLower = dStart + epbShift[s],
+        inclIntervalUpper = dEnd,
+        
+      ) %>% 
+      filter(inclIntervalLower <= DATE & DATE <= inclIntervalUpper)
+    
+    
+    
+    print(paste("Fitting models with epidemic phase bias date shift:",epbShift[s],"days"))  
+
+    pb <- txtProgressBar(max=nmodels)
+    for (i in 1:nmodels){
+      ind <- (s-1)*nmodels + i
+      cxmod <- coxph( models[[i]], data=data.epb )
+      CI <- exp(confint(cxmod))
+      resultList.ebp[[ind]] <- 
+        bind_cols(epbShift  = epbShift[s],
+                  model     = modelDescriptions[i],
+                  covariate = names(coef(cxmod)),
+                  estimate  = exp(coef(cxmod)),
+                  CIL95     = CI[,1],
+                  CIU95     = CI[,2],
+                  StdErr    = sqrt(diag(cxmod$var))
+        )
+      setTxtProgressBar(pb,i)
+    }
+    close(pb)
+    
+  }
+  resultData <- bind_rows(resultList.ebp) 
+  
+  resultData
+  
+}
+
+resultData.ebp <- EpidemicPhaseBias(epbShift=0L:4L)
+resultData.ebp
+
+write.csv(resultData.ebp, paste0("HR_EPB_",country,"_",date_of_analysis,".csv"))
+
+
+```
+
+
